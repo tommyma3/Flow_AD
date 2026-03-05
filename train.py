@@ -150,7 +150,7 @@ if __name__ == '__main__':
 
             with accelerator.accumulate(model):
                 output = model(batch)
-                loss = output.get('loss', output['loss_action'])
+                loss = output['loss'] if 'loss' in output else output['loss_action']
 
                 optimizer.zero_grad(set_to_none=True)
                 accelerator.backward(loss)
