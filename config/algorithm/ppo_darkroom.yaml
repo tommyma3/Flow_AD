@@ -1,0 +1,10 @@
+include: config/algorithm/ppo_base.yaml
+
+n_steps: 200
+batch_size: 50
+n_epochs: 10
+alg_seed: 0
+total_source_timesteps: 50000
+n_stream: 100
+source_lr: 0.0003
+n_process: 8
