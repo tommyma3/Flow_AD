@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument('--num-workers', type=int, default=None)
     parser.add_argument('--mixed-precision', type=str, default='no', choices=['no', 'fp16', 'bf16'])
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
+    parser.add_argument('--no-resume', action='store_true', help='Ignore existing checkpoints and train from scratch.')
     return parser.parse_args()
 
 
@@ -115,14 +116,19 @@ if __name__ == '__main__':
     step = 0
 
     ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
-    if len(ckpt_paths) > 0:
+    if len(ckpt_paths) > 0 and not args.no_resume:
         ckpt_path = ckpt_paths[-1]
         ckpt = torch.load(ckpt_path, map_location='cpu')
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        lr_sched.load_state_dict(ckpt['lr_sched'])
-        step = int(ckpt.get('step', 0))
-        print(f'Checkpoint loaded from {ckpt_path}')
+        try:
+            model.load_state_dict(ckpt['model'])
+            optimizer.load_state_dict(ckpt['optimizer'])
+            lr_sched.load_state_dict(ckpt['lr_sched'])
+            step = int(ckpt.get('step', 0))
+            print(f'Checkpoint loaded from {ckpt_path}')
+        except Exception as err:
+            print(f'WARNING: Failed to resume from {ckpt_path}: {err}')
+            print('WARNING: Starting training from scratch for this run directory.')
+            step = 0
 
     model, optimizer, train_dataloader, test_dataloader, lr_sched = accelerator.prepare(
         model,

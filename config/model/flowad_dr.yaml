@@ -8,22 +8,23 @@ tf_n_layer: 4
 tf_n_head: 4
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
-tf_n_inner: 128
+tf_n_inner: 256
 n_transit: 80
 
 # training
-lr: 0.0003
-train_batch_size: 2048
+lr: 0.001
+train_batch_size: 512
 test_batch_size: 2048
 train_source_timesteps: 1000
 train_timesteps: 50000
 num_warmup_steps: 1000
 
 # flow matching
-flow_train_steps: 4
-flow_eval_steps: 10
+flow_train_steps: 6
+flow_eval_steps: 12
 flow_velocity_scale: 1.0
-flow_action_noise_std: 0.02
-flow_old_policy_smoothing: 0.05
+flow_action_noise_std: 0.01
+flow_policy_loss_weight: 1.0
+flow_prior_init_mix: 0.1
 
 num_workers: 4

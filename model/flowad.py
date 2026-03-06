@@ -58,12 +58,14 @@ class FlowAD(torch.nn.Module):
             nn.SiLU(),
             nn.Linear(tf_n_embd, config['num_actions']),
         )
+        self.pred_policy = nn.Linear(tf_n_embd, config['num_actions'])
 
-        self.flow_train_steps = config.get('flow_train_steps', 4)
+        self.flow_train_steps = config.get('flow_train_steps', 6)
         self.flow_eval_steps = config.get('flow_eval_steps', 10)
         self.flow_velocity_scale = float(config.get('flow_velocity_scale', 1.0))
-        self.flow_action_noise_std = float(config.get('flow_action_noise_std', 0.0))
-        self.flow_old_policy_smoothing = float(config.get('flow_old_policy_smoothing', 0.0))
+        self.flow_action_noise_std = float(config.get('flow_action_noise_std', 0.01))
+        self.flow_policy_loss_weight = float(config.get('flow_policy_loss_weight', 1.0))
+        self.flow_prior_init_mix = float(config.get('flow_prior_init_mix', 0.1))
 
     def transformer(self, x, return_attentions=False):
         output = self.transformer_model(
@@ -78,6 +80,10 @@ class FlowAD(torch.nn.Module):
     def _normalize_policy(self, action_prob):
         action_prob = torch.clamp(action_prob, min=1e-6)
         return action_prob / action_prob.sum(dim=-1, keepdim=True)
+
+    def _sample_base_policy(self, batch_size, device):
+        base_policy = torch.rand((batch_size, self.num_actions), device=device, dtype=torch.float)
+        return self._normalize_policy(base_policy)
 
     def _build_token_sequence(self, states, actions, rewards, query_states, action_t, t):
         state_ids = map_dark_states(states.to(torch.long), self.grid_size)
@@ -97,17 +103,20 @@ class FlowAD(torch.nn.Module):
 
         return torch.cat([context_tokens, query_token, flow_action_token, time_token], dim=1)
 
-    def _predict_velocity_from_output(self, transformer_output):
-        return self.pred_velocity(transformer_output[:, -1])
+    def _forward_flow(self, states, actions, rewards, query_states, action_t, t, return_attentions=False):
+        transformer_input = self._build_token_sequence(
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            query_states=query_states,
+            action_t=action_t,
+            t=t,
+        )
+        transformer_output, attentions = self.transformer(transformer_input, return_attentions=return_attentions)
 
-    def _get_old_policy(self, actions):
-        old_policy = F.one_hot(actions.to(torch.long), num_classes=self.num_actions).to(torch.float)
-        if self.flow_old_policy_smoothing > 0.0:
-            old_policy = (
-                (1.0 - self.flow_old_policy_smoothing) * old_policy
-                + self.flow_old_policy_smoothing / self.num_actions
-            )
-        return self._normalize_policy(old_policy)
+        velocity = self.pred_velocity(transformer_output[:, -1])
+        policy_logits = self.pred_policy(transformer_output[:, -3])
+        return velocity, policy_logits, attentions
 
     def _get_optimal_policy(self, query_states, query_goals):
         query_states = query_states.to(torch.long)
@@ -117,7 +126,6 @@ class FlowAD(torch.nn.Module):
         dy = query_goals[:, 1] - query_states[:, 1]
 
         optimal_policy = torch.zeros((query_states.size(0), self.num_actions), device=query_states.device, dtype=torch.float)
-
         optimal_policy[:, 0] = (dx > 0).to(torch.float)
         optimal_policy[:, 1] = (dx < 0).to(torch.float)
         optimal_policy[:, 2] = (dy > 0).to(torch.float)
@@ -127,6 +135,26 @@ class FlowAD(torch.nn.Module):
         optimal_policy[:, 4] = no_move.to(torch.float)
 
         return self._normalize_policy(optimal_policy)
+
+    def _predict_prior_policy(self, states, actions, rewards, query_states, return_attentions=False):
+        batch_size = query_states.size(0)
+        init_action = torch.full(
+            (batch_size, self.num_actions),
+            fill_value=1.0 / self.num_actions,
+            device=query_states.device,
+            dtype=torch.float,
+        )
+        t0 = torch.zeros((batch_size, 1), device=query_states.device, dtype=torch.float)
+        _, policy_logits, attentions = self._forward_flow(
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            query_states=query_states,
+            action_t=init_action,
+            t=t0,
+            return_attentions=return_attentions,
+        )
+        return F.softmax(policy_logits, dim=-1), policy_logits, attentions
 
     def _integrate_flow(self, states, actions, rewards, query_states, initial_policy, steps, return_attentions=False):
         action_prob = self._normalize_policy(initial_policy)
@@ -145,16 +173,16 @@ class FlowAD(torch.nn.Module):
                 device=query_states.device,
                 dtype=torch.float,
             )
-            transformer_input = self._build_token_sequence(
+            velocity, _, attentions = self._forward_flow(
                 states=states,
                 actions=actions,
                 rewards=rewards,
                 query_states=query_states,
                 action_t=action_prob,
                 t=t,
+                return_attentions=return_attentions,
             )
-            transformer_output, attentions = self.transformer(transformer_input, return_attentions=return_attentions)
-            velocity = self._predict_velocity_from_output(transformer_output)
+            velocity = velocity / max(self.flow_velocity_scale, 1e-6)
             action_prob = self._normalize_policy(action_prob + dt * velocity)
             last_attentions = attentions
 
@@ -163,36 +191,45 @@ class FlowAD(torch.nn.Module):
     def forward(self, x):
         query_states = x['query_states'].to(self.device).to(torch.long)
         query_goals = x['query_goals'].to(self.device).to(torch.long)
-        target_actions = x['target_actions'].to(self.device).to(torch.long)
         states = x['states'].to(self.device)
         actions = x['actions'].to(self.device)
         rewards = x['rewards'].to(self.device)
 
-        old_policy = self._get_old_policy(target_actions)
-        new_policy = self._get_optimal_policy(query_states, query_goals)
+        target_policy = self._get_optimal_policy(query_states, query_goals)
 
         batch_size = query_states.size(0)
+        base_policy = self._sample_base_policy(batch_size=batch_size, device=self.device)
         t = torch.rand((batch_size, 1), device=self.device, dtype=torch.float)
 
-        action_t = (1.0 - t) * old_policy + t * new_policy
+        action_t = (1.0 - t) * base_policy + t * target_policy
         if self.flow_action_noise_std > 0.0:
             action_t = action_t + self.flow_action_noise_std * torch.randn_like(action_t)
         action_t = self._normalize_policy(action_t)
 
-        target_velocity = (new_policy - old_policy) / max(self.flow_velocity_scale, 1e-6)
+        target_velocity = target_policy - base_policy
 
-        transformer_input = self._build_token_sequence(
+        velocity_pred, _, attentions = self._forward_flow(
             states=states,
             actions=actions,
             rewards=rewards,
             query_states=query_states,
             action_t=action_t,
             t=t,
+            return_attentions=False,
         )
-        transformer_output, attentions = self.transformer(transformer_input, return_attentions=False)
 
-        velocity_pred = self._predict_velocity_from_output(transformer_output)
+        prior_policy, prior_logits, _ = self._predict_prior_policy(
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            query_states=query_states,
+            return_attentions=False,
+        )
+
         loss_flow = F.mse_loss(velocity_pred, target_velocity)
+        prior_log_probs = F.log_softmax(prior_logits, dim=-1)
+        loss_policy = -(target_policy * prior_log_probs).sum(dim=-1).mean()
+        loss = loss_flow + self.flow_policy_loss_weight * loss_policy
 
         with torch.no_grad():
             refined_policy, _ = self._integrate_flow(
@@ -200,16 +237,17 @@ class FlowAD(torch.nn.Module):
                 actions=actions,
                 rewards=rewards,
                 query_states=query_states,
-                initial_policy=old_policy,
+                initial_policy=prior_policy,
                 steps=self.flow_train_steps,
                 return_attentions=False,
             )
             pred_actions = refined_policy.argmax(dim=-1)
-            acc_optimal = new_policy.gather(1, pred_actions.unsqueeze(1)).squeeze(1).mean()
+            acc_optimal = target_policy.gather(1, pred_actions.unsqueeze(1)).squeeze(1).mean()
 
         return {
-            'loss': loss_flow,
+            'loss': loss,
             'loss_flow': loss_flow,
+            'loss_policy': loss_policy,
             'acc_action': acc_optimal,
             'acc_action_per_state': acc_optimal,
             'attentions': attentions,
@@ -250,12 +288,18 @@ class FlowAD(torch.nn.Module):
         for _ in range(eval_timesteps):
             query_states_prev = query_states.clone().detach()
 
-            init_policy = torch.full(
-                (vec_env.num_envs, self.num_actions),
-                fill_value=1.0 / self.num_actions,
-                device=self.device,
-                dtype=torch.float,
+            prior_policy, _, _ = self._predict_prior_policy(
+                states=states_hist,
+                actions=actions_hist,
+                rewards=rewards_hist,
+                query_states=query_states,
+                return_attentions=False,
             )
+            uniform_policy = torch.full_like(prior_policy, fill_value=1.0 / self.num_actions)
+            init_policy = self._normalize_policy(
+                (1.0 - self.flow_prior_init_mix) * prior_policy + self.flow_prior_init_mix * uniform_policy
+            )
+
             action_policy, attentions = self._integrate_flow(
                 states=states_hist,
                 actions=actions_hist,
